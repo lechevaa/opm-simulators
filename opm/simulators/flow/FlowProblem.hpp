@@ -588,6 +588,8 @@ public:
         OPM_TIMEBLOCK(beginTimeStep);
         int episodeIdx = this->episodeIndex();
 
+        this->simulator().setTimeStepIndex(this->simulator().timeStepIndex()+1);
+
         this->beginTimeStep_(enableExperiments,
                              episodeIdx,
                              this->simulator().timeStepIndex(),
