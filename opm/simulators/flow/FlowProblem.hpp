@@ -71,6 +71,8 @@
 
 #include <opm/utility/CopyablePtr.hpp>
 
+#include <opm/ml/ml_model.hpp>
+
 #include <algorithm>
 #include <cstddef>
 #include <functional>
@@ -78,6 +80,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <fmt/core.h> 
 
 namespace Opm {
 
@@ -371,6 +374,8 @@ public:
         const int episodeIdx = this->episodeIndex();
         const int timeStepSize = this->simulator().timeStepSize();
 
+        this->simulator().setTimeStepIndex(this->simulator().timeStepIndex()+1);
+
         this->beginTimeStep_(enableExperiments,
                              episodeIdx,
                              this->simulator().timeStepIndex(),
@@ -392,6 +397,137 @@ public:
         wellModel_.beginTimeStep();
         aquiferModel_.beginTimeStep();
         tracerModel_.beginTimeStep();
+
+        //----- Hybrid Newton ---- 
+        auto& eclState = this->simulator().vanguard().eclState();
+        auto& fp = eclState.fieldProps();
+
+        auto permX = fp.get_double("PERMX");
+        auto permY = fp.get_double("PERMY");
+        auto permZ = fp.get_double("PERMZ");
+
+        // std::vector<std::string> names = {"A1", "A2", "A3", "A4", "A5", "A6"};
+        std::vector<std::string> names = {"A1"};
+        std::map<std::string, std::vector<std::tuple<double, double>>> well_scalers_x;
+        // Po, Rv, Rs, Kx, Ky, Kz: (min, scale)
+        well_scalers_x["A1"] = { {-0.40810012, 0.00376344}, {-0.17560817, 3107.90800192}, {0., 0.00534186}, 
+        {-0.10028387, 0.30676937}, {-0.10004034, 0.30629669} , {0.2841663, 0.21359803}};
+        well_scalers_x["A2"] = { {-1.86764807, 0.00909265}, {-0.80103727, 6906.41100986}, {-1.53086296, 0.01409821}, 
+        {0.02985989, 0.29389012}, {0.02980721, 0.29390608}, {0.26387102, 0.23906647} };
+        well_scalers_x["A3"] = { {-0.51449184, 0.00474457}, {-0.26737825, 4732.05208554}, {-0.476439, 0.00825324}, 
+        {0.10945343, 0.24829266}, {0.10882279, 0.24814056} , {0.4806256, 0.15497643}};
+
+        well_scalers_x["A4"] = { {-0.40810012, 0.00376344}, {-0.17560817, 3107.90800192}, {0., 0.00534186}, 
+        {-0.10028387, 0.30676937}, {-0.10004034, 0.30629669} , {0.2841663, 0.21359803}};
+        well_scalers_x["A5"] ={ {-0.40810012, 0.00376344}, {-0.17560817, 3107.90800192}, {0., 0.00534186}, 
+        {-0.10028387, 0.30676937}, {-0.10004034, 0.30629669} , {0.2841663, 0.21359803}};
+
+        well_scalers_x["A6"] = { {-1.30150202, 0.00714262}, {-0.5489008, 5664.13911073}, {0., 0.00540424}, 
+        {0.07792149, 0.2633433}, {0.07721239, 0.26004278} , {0.49508477, 0.15651543}};
+
+        well_scalers_x["dt"] =  { {-0.03333333, 0.03333333}};
+
+        std::vector<std::string> presentNames;
+        for (const auto& name : names) {
+        if (wellModel_.hasWell(name)) {
+            presentNames.push_back(name);
+            }
+        }
+        std::cout << "Wells that are present: ";
+        for (const auto& name : presentNames) {
+            std::cout << name << " ";
+        }
+        std::cout << std::endl;        
+
+        for (const auto& name : presentNames) {
+
+            std::string fileName = fmt::format("../../../opm/opm-common/opm/ml/ml_tools/models/hybrid_newton/{}.csv", name);
+            std::ifstream file(fileName);
+
+            std::string line;
+            std::getline(file, line);
+
+            file.close();
+
+            // Extract cell indexes from file
+            std::vector<int> well_cell_indexes;
+            std::stringstream ss(line);
+
+            // Find the substring containing the integers
+            std::string substr;
+            while (std::getline(ss, substr, '[') && !ss.eof());
+
+            // Extract integers from the substring
+            std::stringstream int_ss(substr);
+            int num;
+            while (int_ss >> num) {
+                well_cell_indexes.push_back(num);
+                if (int_ss.peek() == ',') {
+                    int_ss.ignore();
+                }
+            }
+            int well_size = well_cell_indexes.size();
+            auto well_scaler = well_scalers_x[name];
+
+            NNModel<Evaluation> model;
+            std::string modelFileName = fmt::format("../../../opm/opm-common/opm/ml/ml_tools/models/hybrid_newton/{}.model", name);
+            model.loadModel(modelFileName);
+            Tensor<Evaluation> in{1, 8 * well_size + 1};
+
+            for (int i = 0; i < well_size; ++i){
+                const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
+                auto fs = intQuants.fluidState();
+                auto po = getValue(fs.pressure(oilPhaseIdx));
+                auto sg = getValue(fs.saturation(gasPhaseIdx));
+                auto sw = getValue(fs.saturation(waterPhaseIdx));
+                auto rs = getValue(fs.Rs());
+                auto rv = getValue(fs.Rv());
+
+                // std::cout << name << "init cell: " << well_cell_indexes[i] <<  " Rv "<<  rv << " Rs " << rs << std::endl;
+
+                in(0 * well_size + i) =  ((po / Opm::unit::barsa) - std::get<0>(well_scaler[0])) * std::get<1>(well_scaler[0]);
+                in(1 * well_size + i) = sw;
+                in(2 * well_size + i) = sg;
+                in(3 * well_size + i) = (rv - std::get<0>(well_scaler[1])) * std::get<1>(well_scaler[1]);
+                in(4 * well_size + i) = (rs - std::get<0>(well_scaler[2])) * std::get<1>(well_scaler[2]);
+                in(5 * well_size + i) = (log10(permX[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - std::get<0>(well_scaler[3])) * std::get<1>(well_scaler[3]);
+                in(6 * well_size + i) = (log10(permY[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - std::get<0>(well_scaler[4])) * std::get<1>(well_scaler[4]);
+                in(7 * well_size + i) = (log10(permZ[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - std::get<0>(well_scaler[5])) * std::get<1>(well_scaler[5]);
+            }
+
+            in(8 * well_cell_indexes.size()) = ((this->simulator().timeStepSize() / Opm::unit::day) - std::get<0>(well_scalers_x["dt"][0])) * std::get<1>(well_scalers_x["dt"][0]);
+            Tensor<Evaluation> out{5 * well_size};
+            model.apply(in, out);
+
+            for (int i = 0; i < well_size; ++i){
+                const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
+                auto fs = intQuants.fluidState();
+
+                fs.setSaturation(waterPhaseIdx, out(1 * well_size + i));
+                fs.setSaturation(gasPhaseIdx, out(2 * well_size + i));
+                fs.setSaturation(oilPhaseIdx, 1 - out(1 * well_size + i) - out(2 * well_size + i));
+
+
+                fs.setRv(out(3 * well_size + i) / std::get<1>(well_scaler[1]) + std::get<0>(well_scaler[1]));
+                fs.setRs(out(4 * well_size + i) / std::get<1>(well_scaler[2]) + std::get<0>(well_scaler[2]));
+
+                // std::cout << name << "pred cell: " << well_cell_indexes[i] <<  " Rv "<<  getValue(fs.Rv()) << " Rs " << getValue(fs.Rs()) << std::endl;
+
+                std::array<Evaluation, numPhases> pC;
+                const auto& materialParams = this->materialLawParams(well_cell_indexes[i]);
+                MaterialLaw::capillaryPressures(pC, materialParams, fs);
+                auto pred_po = (out(0 * well_size + i) / std::get<1>(well_scaler[0]) + std::get<0>(well_scaler[0]))  * Opm::unit::barsa;
+                for (unsigned phaseIdx = 0; phaseIdx < numPhases; ++phaseIdx)
+                    if (FluidSystem::phaseIsActive(phaseIdx))
+                        fs.setPressure(phaseIdx, pred_po + (pC[phaseIdx] - pC[oilPhaseIdx]));
+
+                auto& primaryVars = this->model().solution(/*timeIdx*/0)[well_cell_indexes[i]];
+                primaryVars.assignNaive(fs);
+            }
+
+            this->model().invalidateAndUpdateIntensiveQuantities(/*timeIdx*/0);
+            //----- End of Hybrid Newton ---- 
+        };
 
     }
 
