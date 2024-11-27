@@ -72,6 +72,9 @@
 #include <opm/utility/CopyablePtr.hpp>
 
 #include <opm/ml/ml_model.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
+#include <unordered_map>
 
 #include <algorithm>
 #include <cstddef>
@@ -394,69 +397,128 @@ public:
             this->model().linearizer().updateBoundaryConditionData();
         }
 
+        //----- Hybrid Newton ---- 
+         
+        auto& eclState = this->simulator().vanguard().eclState();
+        auto& fp = eclState.fieldProps();
+        
+        auto permX = fp.get_double("PERMX");
+               
+        std::vector<std::string> names;
+        std::string wells_filename = "En_ml_models/well_models_ready.json";
+        std::ifstream wells_ready(wells_filename);
+        if (wells_ready.is_open()){
+            boost::property_tree::ptree pt;
+            try {
+                boost::property_tree::read_json(wells_ready, pt);
+            } catch (boost::property_tree::json_parser::json_parser_error& e) {
+                OPM_THROW(std::logic_error, "Error cannot parse json file '" + wells_filename + "'");
+            }
+            for (const auto& item : pt) {
+                names.push_back(item.second.get_value<std::string>());
+            }
+        } else {
+            names = {};
+        }
+        wells_ready.close();
+
+        // Well finding before updating wellModel
+        // std::vector<std::string> WellEvent;
+        // for (const auto& name : names) {
+        // if (wellModel_.hasWell(name)) {
+        //     WellEvent.push_back(name);
+        //     }
+        // }
+
         wellModel_.beginTimeStep();
         aquiferModel_.beginTimeStep();
         tracerModel_.beginTimeStep();
 
-        //----- Hybrid Newton ---- 
-        auto& eclState = this->simulator().vanguard().eclState();
-        auto& fp = eclState.fieldProps();
-
-        auto permX = fp.get_double("PERMX");
-        auto permY = fp.get_double("PERMY");
-        auto permZ = fp.get_double("PERMZ");
-
-        // std::vector<std::string> names = {"A1", "A2", "A3", "A4", "A5", "A6"};
-        std::vector<std::string> names = {"A1"};
-        std::map<std::string, std::vector<std::tuple<double, double>>> well_scalers_x;
-        // Po, Rv, Rs, Kx, Ky, Kz: (min, scale)
-        well_scalers_x["A1"] = { {-0.40810012, 0.00376344}, {-0.17560817, 3107.90800192}, {0., 0.00534186}, 
-        {-0.10028387, 0.30676937}, {-0.10004034, 0.30629669} , {0.2841663, 0.21359803}};
-        well_scalers_x["A2"] = { {-1.86764807, 0.00909265}, {-0.80103727, 6906.41100986}, {-1.53086296, 0.01409821}, 
-        {0.02985989, 0.29389012}, {0.02980721, 0.29390608}, {0.26387102, 0.23906647} };
-        well_scalers_x["A3"] = { {-0.51449184, 0.00474457}, {-0.26737825, 4732.05208554}, {-0.476439, 0.00825324}, 
-        {0.10945343, 0.24829266}, {0.10882279, 0.24814056} , {0.4806256, 0.15497643}};
-
-        well_scalers_x["A4"] = { {-0.40810012, 0.00376344}, {-0.17560817, 3107.90800192}, {0., 0.00534186}, 
-        {-0.10028387, 0.30676937}, {-0.10004034, 0.30629669} , {0.2841663, 0.21359803}};
-        well_scalers_x["A5"] ={ {-0.40810012, 0.00376344}, {-0.17560817, 3107.90800192}, {0., 0.00534186}, 
-        {-0.10028387, 0.30676937}, {-0.10004034, 0.30629669} , {0.2841663, 0.21359803}};
-
-        well_scalers_x["A6"] = { {-1.30150202, 0.00714262}, {-0.5489008, 5664.13911073}, {0., 0.00540424}, 
-        {0.07792149, 0.2633433}, {0.07721239, 0.26004278} , {0.49508477, 0.15651543}};
-
-        well_scalers_x["dt"] =  { {-0.03333333, 0.03333333}};
-
+        // Well finding
         std::vector<std::string> presentNames;
         for (const auto& name : names) {
         if (wellModel_.hasWell(name)) {
             presentNames.push_back(name);
             }
         }
+
+        std::cout << "Well models that are ready: ";
+        for (const auto& name : names) {
+            std::cout << name << std::endl;
+        }
+
+        std::cout << "simulator time: "<< this->simulator().time() << "  "<< 68*60*60*24<<std::endl;
+        std::unordered_map<std::string, float> well_openings = {
+            {"A1", 4.},
+            {"A2", 68.},
+            {"A5", 127.},
+            {"A4", 264.},
+            {"A3", 193.},
+            {"A6", 320.},
+            };
+
+        if (this->simulator().time() == 68*60*60*24) {
+            std::cout << "true" << std::endl;
+        } else {
+            std::cout << "false" << std::endl;
+        }
+
+        float current_time = this->simulator().time();
+        std::vector<std::string> matching_wells;
+        for (const auto& well_name : names) {
+            // Check if the well name exists in well_openings
+            auto it = well_openings.find(well_name);
+            if (it != well_openings.end() && it->second * 60 * 60 * 24 == current_time) {
+                // If the opening time matches current_time, save the well name
+                matching_wells.push_back(well_name);
+            }
+        }
+
+        std::cout << "Wells matching the simulation time:" << std::endl;
+        for (const auto& well : matching_wells) {
+            std::cout << well << std::endl;
+        }
+        // std::cout << "Wells that were present: ";
+        // for (const auto& name : WellEvent) {
+        //     std::cout << name << " ";
+        // }        
+        // std::cout << std::endl; 
+
         std::cout << "Wells that are present: ";
         for (const auto& name : presentNames) {
             std::cout << name << " ";
-        }
+        }        
         std::cout << std::endl;        
 
-        for (const auto& name : presentNames) {
+        // presentNames.erase(std::remove_if(presentNames.begin(), presentNames.end(), [&](const std::string& elem) {
+        // return std::find(WellEvent.begin(), WellEvent.end(), elem) != WellEvent.end();
+        // }), presentNames.end());
 
-            std::string fileName = fmt::format("../../../opm/opm-common/opm/ml/ml_tools/models/hybrid_newton/{}.csv", name);
+        std::cout << "Final well list: ";
+        for (const auto& name : matching_wells) {
+            std::cout << name << " ";
+        }    
+        std::cout << std::endl; 
+
+        
+
+        for (const auto& name : matching_wells) {
+            std::cout << "Using well model " << name << std::endl; 
+            const auto& ws = wellModel_.wellState()[name];
+            Scalar resv = std::accumulate(ws.reservoir_rates.begin(), ws.reservoir_rates.end(), 0.);
+
+            // Load well local domain
+            std::string fileName = fmt::format("En_ml_data/{}_local_domain.csv", name);
             std::ifstream file(fileName);
-
             std::string line;
             std::getline(file, line);
-
             file.close();
-
             // Extract cell indexes from file
             std::vector<int> well_cell_indexes;
             std::stringstream ss(line);
-
             // Find the substring containing the integers
             std::string substr;
             while (std::getline(ss, substr, '[') && !ss.eof());
-
             // Extract integers from the substring
             std::stringstream int_ss(substr);
             int num;
@@ -466,69 +528,177 @@ public:
                     int_ss.ignore();
                 }
             }
-            int well_size = well_cell_indexes.size();
-            auto well_scaler = well_scalers_x[name];
 
-            NNModel<Evaluation> model;
-            std::string modelFileName = fmt::format("../../../opm/opm-common/opm/ml/ml_tools/models/hybrid_newton/{}.model", name);
-            model.loadModel(modelFileName);
-            Tensor<Evaluation> in{1, 8 * well_size + 1};
+            // Scaler loading and finding
+            std::vector<std::string> filenames_json = {
+                fmt::format("En_ml_models/scalers/{}/X_scaler.json", name),
+                fmt::format("En_ml_models/scalers/{}/Y_scaler.json", name),
+                fmt::format("En_ml_models/scalers/{}/dt_scaler.json", name),
+                fmt::format("En_ml_models/scalers/{}/RESV_scaler.json", name),
+            };
 
-            for (int i = 0; i < well_size; ++i){
-                const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
-                auto fs = intQuants.fluidState();
-                auto po = getValue(fs.pressure(oilPhaseIdx));
-                auto sg = getValue(fs.saturation(gasPhaseIdx));
-                auto sw = getValue(fs.saturation(waterPhaseIdx));
-                auto rs = getValue(fs.Rs());
-                auto rv = getValue(fs.Rv());
-
-                // std::cout << name << "init cell: " << well_cell_indexes[i] <<  " Rv "<<  rv << " Rs " << rs << std::endl;
-
-                in(0 * well_size + i) =  ((po / Opm::unit::barsa) - std::get<0>(well_scaler[0])) * std::get<1>(well_scaler[0]);
-                in(1 * well_size + i) = sw;
-                in(2 * well_size + i) = sg;
-                in(3 * well_size + i) = (rv - std::get<0>(well_scaler[1])) * std::get<1>(well_scaler[1]);
-                in(4 * well_size + i) = (rs - std::get<0>(well_scaler[2])) * std::get<1>(well_scaler[2]);
-                in(5 * well_size + i) = (log10(permX[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - std::get<0>(well_scaler[3])) * std::get<1>(well_scaler[3]);
-                in(6 * well_size + i) = (log10(permY[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - std::get<0>(well_scaler[4])) * std::get<1>(well_scaler[4]);
-                in(7 * well_size + i) = (log10(permZ[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - std::get<0>(well_scaler[5])) * std::get<1>(well_scaler[5]);
+            std::vector<std::unordered_map<std::string, std::vector<double>>> scaler_params_list;
+            for (const auto& filename_json : filenames_json) {
+                std::ifstream file_json(filename_json);
+                boost::property_tree::ptree pt;
+                try {
+                    boost::property_tree::read_json(file_json, pt);
+                } catch (boost::property_tree::json_parser::json_parser_error& e) {
+                    OPM_THROW(std::logic_error, "Error cannot parse json file '" + filename_json + "'");
+                }
+                file_json.close();
+                std::unordered_map<std::string, std::vector<double>> scaler_params;
+                for (const auto& item : pt) {
+                    std::vector<double> values;
+                    for (const auto& value : item.second) {
+                        values.push_back(value.second.get_value<double>());
+                    }
+                    scaler_params[item.first] = values;
+                }
+                scaler_params_list.push_back(scaler_params);
             }
 
-            in(8 * well_cell_indexes.size()) = ((this->simulator().timeStepSize() / Opm::unit::day) - std::get<0>(well_scalers_x["dt"][0])) * std::get<1>(well_scalers_x["dt"][0]);
-            Tensor<Evaluation> out{5 * well_size};
-            model.apply(in, out);
+            int well_size = well_cell_indexes.size();
+
+            NNModel<Evaluation> model;
+            std::string modelFileName = fmt::format("En_ml_models/{}.model", name);
+            model.loadModel(modelFileName);
+            Tensor<Evaluation> in{6 * well_size + 2};
 
             for (int i = 0; i < well_size; ++i){
                 const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
                 auto fs = intQuants.fluidState();
+                auto po = fs.pressure(oilPhaseIdx);
+                auto sw = fs.saturation(waterPhaseIdx);
+                auto so = fs.saturation(oilPhaseIdx);
+                auto rv = fs.Rv();
+                auto rs = fs.Rs();
 
-                fs.setSaturation(waterPhaseIdx, out(1 * well_size + i));
-                fs.setSaturation(gasPhaseIdx, out(2 * well_size + i));
-                fs.setSaturation(oilPhaseIdx, 1 - out(1 * well_size + i) - out(2 * well_size + i));
+                // std::cout << name << " Init cell: " << well_cell_indexes[i] <<  " Po " <<  getValue(po) << " Sw " << getValue(sw) << " So " << getValue(so) << "  RV "<< getValue(rv) << " RS " << getValue(rs) << std::endl;
+                // std::cout << name << " Init cell: " << well_cell_indexes[i] <<  " Rv scaled " << (log10(1e-7 + rv)  - scaler_params_list[0].at("data_min_")[3]) / (scaler_params_list[0].at("data_max_")[3] - scaler_params_list[0].at("data_min_")[3]) << std::endl;
+                // std::cout << name << " Init cell: " << well_cell_indexes[i] <<  " Rs scaled " << (log(1. + rs)  - scaler_params_list[0].at("data_min_")[4]) / (scaler_params_list[0].at("data_max_")[4] - scaler_params_list[0].at("data_min_")[4]) << std::endl;
+                // std::cout << name << " Init cell: " << well_cell_indexes[i] <<  " K scaled " << (log10(1e-7 + permX[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - scaler_params_list[0].at("data_min_")[5]) / (scaler_params_list[0].at("data_max_")[5] - scaler_params_list[0].at("data_min_")[5]) << std::endl;
+                
+                in(0 * well_size + i) =  max(0., min(1., (log10(1e-7 + po / Opm::unit::barsa) - scaler_params_list[0].at("data_min_")[0]) / (scaler_params_list[0].at("data_max_")[0] - scaler_params_list[0].at("data_min_")[0])));
 
+                if (scaler_params_list[0].at("data_min_")[1] == scaler_params_list[0].at("data_max_")[1]){
+                    in(1 * well_size + i) = scaler_params_list[0].at("data_min_")[1];
+                } else{
+                    in(1 * well_size + i) = max(0., min(1., (sw  - scaler_params_list[0].at("data_min_")[1]) / (scaler_params_list[0].at("data_max_")[1] - scaler_params_list[0].at("data_min_")[1])));
+                }
+                if (scaler_params_list[0].at("data_min_")[2] == scaler_params_list[0].at("data_max_")[2]){
+                    in(2 * well_size + i) = scaler_params_list[0].at("data_min_")[2];
+                } else{
+                    in(2 * well_size + i) = max(0., min(1., (so  - scaler_params_list[0].at("data_min_")[2]) / (scaler_params_list[0].at("data_max_")[2] - scaler_params_list[0].at("data_min_")[2])));
+                }
+                
+                in(3 * well_size + i) = max(0., min(1., (log10(1e-7 + rv)  - scaler_params_list[0].at("data_min_")[3]) / (scaler_params_list[0].at("data_max_")[3] - scaler_params_list[0].at("data_min_")[3])));
+                in(4 * well_size + i) = max(0., min(1., (log(1. + rs)  - scaler_params_list[0].at("data_min_")[4]) / (scaler_params_list[0].at("data_max_")[4] - scaler_params_list[0].at("data_min_")[4])));
+                in(5 * well_size + i) = max(0., min(1., (log10(1e-7 + permX[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - scaler_params_list[0].at("data_min_")[5]) / (scaler_params_list[0].at("data_max_")[5] - scaler_params_list[0].at("data_min_")[5])));
+            }
 
-                fs.setRv(out(3 * well_size + i) / std::get<1>(well_scaler[1]) + std::get<0>(well_scaler[1]));
-                fs.setRs(out(4 * well_size + i) / std::get<1>(well_scaler[2]) + std::get<0>(well_scaler[2]));
+            in(6 * well_cell_indexes.size()) = max(0., min(1.,(log10(1e-7 + this->simulator().timeStepSize()) - scaler_params_list[2].at("data_min_")[0]) / (scaler_params_list[2].at("data_max_")[0] - scaler_params_list[2].at("data_min_")[0])));
+            in(6 * well_cell_indexes.size() + 1) = max(0., min(1., (log(1. + abs(resv)) - scaler_params_list[3].at("data_min_")[0]) / (scaler_params_list[3].at("data_max_")[0] - scaler_params_list[3].at("data_min_")[0])));
 
-                // std::cout << name << "pred cell: " << well_cell_indexes[i] <<  " Rv "<<  getValue(fs.Rv()) << " Rs " << getValue(fs.Rs()) << std::endl;
+            for (int i = 0; i < well_size; ++i){
+                const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
+                auto fs = intQuants.fluidState();
+                auto po = fs.pressure(oilPhaseIdx);
+                auto sw = fs.saturation(waterPhaseIdx);
+                auto so = fs.saturation(oilPhaseIdx);
+                auto rv = fs.Rv();
+                auto rs = fs.Rs();
+                if (isnan(in(0 * well_size + i))){
+                    std::cout << "INPUT Po BIG ISSUE: "<< i << in(0 * well_size + i) << po << std::endl;
+                }
+                if (isnan(in(1 * well_size + i))){
+                    std::cout << "INPUT SW BIG ISSUE: "<< i << in(1 * well_size + i) << sw << std::endl;
+                    std::cout << "SCALER SW:" << scaler_params_list[0].at("data_min_")[1] << scaler_params_list[0].at("data_max_")[1] << std::endl;
+                }
+                if (isnan(in(2 * well_size + i))){
+                    std::cout << "INPUT SO BIG ISSUE: "<< i << in(2 * well_size + i) << so <<std::endl;
+                }
+                if (isnan(in(3 * well_size + i))){
+                    std::cout << "INPUT RV BIG ISSUE: "<< i << in(3 * well_size + i) << rv << std::endl;
+                }
+                if (isnan(in(4 * well_size + i))){
+                    std::cout << "INPUT RS BIG ISSUE: "<< i << in(4 * well_size + i) << rs << std::endl;
+                }
+                if (isnan(in(5 * well_size + i))){
+                    std::cout << "INPUT K BIG ISSUE: "<< i << in(5 * well_size + i) << permX[i] << std::endl;
+                }
+            }
+            Tensor<Evaluation> out{1, 5 * well_size};
+            model.apply(in, out);
 
-                std::array<Evaluation, numPhases> pC;
-                const auto& materialParams = this->materialLawParams(well_cell_indexes[i]);
-                MaterialLaw::capillaryPressures(pC, materialParams, fs);
-                auto pred_po = (out(0 * well_size + i) / std::get<1>(well_scaler[0]) + std::get<0>(well_scaler[0]))  * Opm::unit::barsa;
-                for (unsigned phaseIdx = 0; phaseIdx < numPhases; ++phaseIdx)
-                    if (FluidSystem::phaseIsActive(phaseIdx))
-                        fs.setPressure(phaseIdx, pred_po + (pC[phaseIdx] - pC[oilPhaseIdx]));
+            // for (int i = 0; i < 5 * well_size; ++i){
+            //     if (isnan(out(i))){
+            //         std::cout << "OUTPUT BIG ISSUE: "<< i << std::endl;
+            //     }
+            // }
 
+            for (int i = 0; i < well_size; ++i){
+                const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
+                auto fs = intQuants.fluidState();
+                Evaluation sw_pred; 
+                Evaluation so_pred; 
+
+                auto po_pred = pow(10,  scaler_params_list[1].at("data_min_")[0] + out(0 * well_size + i) * (scaler_params_list[1].at("data_max_")[0] - scaler_params_list[1].at("data_min_")[0])) * Opm::unit::barsa;
+                if (scaler_params_list[0].at("data_min_")[1] != scaler_params_list[0].at("data_max_")[1]){
+                    if (getValue(fs.saturation(waterPhaseIdx)) > 0.){
+                        sw_pred = max(scaler_params_list[1].at("data_min_")[1] + out(1 * well_size + i) * (scaler_params_list[1].at("data_max_")[1] - scaler_params_list[1].at("data_min_")[1]), 0.);
+                    } else {
+                        sw_pred = 0.;
+                    }
+                } else{
+                    sw_pred = scaler_params_list[0].at("data_min_")[1];
+                }
+                if (scaler_params_list[0].at("data_min_")[2] != scaler_params_list[0].at("data_max_")[2]){
+                    if (getValue(fs.saturation(oilPhaseIdx)) > 0.){
+                        so_pred = max(scaler_params_list[1].at("data_min_")[2] + out(2 * well_size + i) * (scaler_params_list[1].at("data_max_")[2] - scaler_params_list[1].at("data_min_")[2]), 0.);
+                    } else {
+                        so_pred = 0.;
+                    }
+                } else{
+                    so_pred = scaler_params_list[0].at("data_min_")[2]; 
+                }
+                auto rv_pred = max(pow(10, scaler_params_list[1].at("data_min_")[3] + out(3 * well_size + i) * (scaler_params_list[1].at("data_max_")[3] - scaler_params_list[1].at("data_min_")[3])) - 1e-7, 0.0); 
+                auto rs_pred = max(exp(scaler_params_list[1].at("data_min_")[4] + out(4 * well_size + i) * (scaler_params_list[1].at("data_max_")[4] - scaler_params_list[1].at("data_min_")[4])) - 1., 0.0);
+                
+                auto sw = max(0., min(sw_pred, 1.));
+                auto so = max(0., min(so_pred, 1.));
+                auto sg = max(0., min(1. - so_pred - sw_pred, 1.));
+                Scalar st = getValue(sw) + getValue(so) + getValue(sg);
+                fs.setSaturation(waterPhaseIdx, getValue(sw)/st);
+                fs.setSaturation(gasPhaseIdx, getValue(sg)/st);
+                fs.setSaturation(oilPhaseIdx, getValue(so)/st);
+                
+                fs.setRv(getValue(rv_pred));
+                fs.setRs(getValue(rs_pred));
+
+             
+                // std::cout << name << " Pred cell: " << well_cell_indexes[i] <<  " Po " <<  getValue(po_pred) << " Sw " << getValue(sw_pred) << " So " << getValue(so_pred) << "  RV "<< getValue(rv_pred) << " RS " << getValue(rs_pred) << std::endl;
+                
+                
+                // std::array<Evaluation, numPhases> pC;
+                // const auto& materialParams = this->materialLawParams(well_cell_indexes[i]);
+                // MaterialLaw::capillaryPressures(pC, materialParams, fs);
+                // // std::cout << name << " pred cell: " << well_cell_indexes[i] <<  " Po " <<  po_pred << std::endl;
+                // for (unsigned phaseIdx = 0; phaseIdx < numPhases; ++phaseIdx)
+                //     if (FluidSystem::phaseIsActive(phaseIdx))
+                //         fs.setPressure(phaseIdx, po_pred + (pC[phaseIdx] - pC[oilPhaseIdx]));
+                
+                
+                // std::cout << name << " pred cell: " << well_cell_indexes[i] <<  " Po " <<  getValue(po_pred) << " Sw " << getValue(sw_pred)/st << " So " << getValue(so_pred)/st << "  RV "<< getValue(rv_pred) << " RS " << getValue(rs_pred) << std::endl;
+                
+                
                 auto& primaryVars = this->model().solution(/*timeIdx*/0)[well_cell_indexes[i]];
                 primaryVars.assignNaive(fs);
             }
-
-            this->model().invalidateAndUpdateIntensiveQuantities(/*timeIdx*/0);
-            //----- End of Hybrid Newton ---- 
+            
+            this->model().invalidateAndUpdateIntensiveQuantities(/*timeIdx*/0); 
         };
-
+            //----- End of Hybrid Newton ---- 
     }
 
     /*!
