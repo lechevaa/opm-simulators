@@ -84,6 +84,7 @@
 #include <string>
 #include <vector>
 #include <fmt/core.h> 
+#include <utility>
 
 namespace Opm {
 
@@ -422,14 +423,6 @@ public:
         }
         wells_ready.close();
 
-        // Well finding before updating wellModel
-        // std::vector<std::string> WellEvent;
-        // for (const auto& name : names) {
-        // if (wellModel_.hasWell(name)) {
-        //     WellEvent.push_back(name);
-        //     }
-        // }
-
         wellModel_.beginTimeStep();
         aquiferModel_.beginTimeStep();
         tracerModel_.beginTimeStep();
@@ -442,65 +435,47 @@ public:
             }
         }
 
-        std::cout << "Well models that are ready: ";
-        for (const auto& name : names) {
-            std::cout << name << std::endl;
-        }
-
-        std::cout << "simulator time: "<< this->simulator().time() << "  "<< 68*60*60*24<<std::endl;
-        std::unordered_map<std::string, float> well_openings = {
-            {"A1", 4.},
-            {"A2", 68.},
-            {"A5", 127.},
-            {"A4", 264.},
-            {"A3", 193.},
-            {"A6", 320.},
-            };
-
-        if (this->simulator().time() == 68*60*60*24) {
-            std::cout << "true" << std::endl;
-        } else {
-            std::cout << "false" << std::endl;
-        }
+        // std::cout << "simulator time: "<< this->simulator().time() << "  "<< 68*60*60*24<<std::endl;
+        // std::unordered_map<std::string, float> well_openings = {
+        //     {"A1", 4.},
+        //     {"A2", 68.},
+        //     {"A5", 127.},
+        //     {"A4", 264.},
+        //     {"A3", 193.},
+        //     {"A6", 320.},
+        //     };
+        
+        std::unordered_map<std::string, std::pair<float, float>> well_openings = {
+            {"A2", {68., 68.}},
+            {"C-1H", {1321., 1321.}},
+            {"C-4H", {414., 414.}},
+            {"E-3CH", {2733., 2733.}}
+        };
 
         float current_time = this->simulator().time();
         std::vector<std::string> matching_wells;
+        // for (const auto& well_name : names) {
+        //     // Check if the well name exists in well_openings
+        //     auto it = well_openings.find(well_name);
+        //     if (it != well_openings.end() && it->second * 60 * 60 * 24 == current_time) {
+        //         // If the opening time matches current_time, save the well name
+        //         matching_wells.push_back(well_name);
+        //     }
+        // }        
+
         for (const auto& well_name : names) {
             // Check if the well name exists in well_openings
             auto it = well_openings.find(well_name);
-            if (it != well_openings.end() && it->second * 60 * 60 * 24 == current_time) {
-                // If the opening time matches current_time, save the well name
-                matching_wells.push_back(well_name);
+            if (it != well_openings.end()) {
+                // Get the interval and check if current_time falls within it
+                auto [start_time, end_time] = it->second; // Destructure the pair
+                float current_time_in_days = current_time / (60 * 60 * 24);
+                if (current_time_in_days >= start_time && current_time_in_days <= end_time) {
+                    // If current time is within the interval, save the well name
+                    matching_wells.push_back(well_name);
+                }
             }
         }
-
-        std::cout << "Wells matching the simulation time:" << std::endl;
-        for (const auto& well : matching_wells) {
-            std::cout << well << std::endl;
-        }
-        // std::cout << "Wells that were present: ";
-        // for (const auto& name : WellEvent) {
-        //     std::cout << name << " ";
-        // }        
-        // std::cout << std::endl; 
-
-        std::cout << "Wells that are present: ";
-        for (const auto& name : presentNames) {
-            std::cout << name << " ";
-        }        
-        std::cout << std::endl;        
-
-        // presentNames.erase(std::remove_if(presentNames.begin(), presentNames.end(), [&](const std::string& elem) {
-        // return std::find(WellEvent.begin(), WellEvent.end(), elem) != WellEvent.end();
-        // }), presentNames.end());
-
-        std::cout << "Final well list: ";
-        for (const auto& name : matching_wells) {
-            std::cout << name << " ";
-        }    
-        std::cout << std::endl; 
-
-        
 
         for (const auto& name : matching_wells) {
             std::cout << "Using well model " << name << std::endl; 
@@ -574,11 +549,6 @@ public:
                 auto rv = fs.Rv();
                 auto rs = fs.Rs();
 
-                // std::cout << name << " Init cell: " << well_cell_indexes[i] <<  " Po " <<  getValue(po) << " Sw " << getValue(sw) << " So " << getValue(so) << "  RV "<< getValue(rv) << " RS " << getValue(rs) << std::endl;
-                // std::cout << name << " Init cell: " << well_cell_indexes[i] <<  " Rv scaled " << (log10(1e-7 + rv)  - scaler_params_list[0].at("data_min_")[3]) / (scaler_params_list[0].at("data_max_")[3] - scaler_params_list[0].at("data_min_")[3]) << std::endl;
-                // std::cout << name << " Init cell: " << well_cell_indexes[i] <<  " Rs scaled " << (log(1. + rs)  - scaler_params_list[0].at("data_min_")[4]) / (scaler_params_list[0].at("data_max_")[4] - scaler_params_list[0].at("data_min_")[4]) << std::endl;
-                // std::cout << name << " Init cell: " << well_cell_indexes[i] <<  " K scaled " << (log10(1e-7 + permX[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - scaler_params_list[0].at("data_min_")[5]) / (scaler_params_list[0].at("data_max_")[5] - scaler_params_list[0].at("data_min_")[5]) << std::endl;
-                
                 in(0 * well_size + i) =  max(0., min(1., (log10(1e-7 + po / Opm::unit::barsa) - scaler_params_list[0].at("data_min_")[0]) / (scaler_params_list[0].at("data_max_")[0] - scaler_params_list[0].at("data_min_")[0])));
 
                 if (scaler_params_list[0].at("data_min_")[1] == scaler_params_list[0].at("data_max_")[1]){
@@ -600,42 +570,8 @@ public:
             in(6 * well_cell_indexes.size()) = max(0., min(1.,(log10(1e-7 + this->simulator().timeStepSize()) - scaler_params_list[2].at("data_min_")[0]) / (scaler_params_list[2].at("data_max_")[0] - scaler_params_list[2].at("data_min_")[0])));
             in(6 * well_cell_indexes.size() + 1) = max(0., min(1., (log(1. + abs(resv)) - scaler_params_list[3].at("data_min_")[0]) / (scaler_params_list[3].at("data_max_")[0] - scaler_params_list[3].at("data_min_")[0])));
 
-            for (int i = 0; i < well_size; ++i){
-                const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
-                auto fs = intQuants.fluidState();
-                auto po = fs.pressure(oilPhaseIdx);
-                auto sw = fs.saturation(waterPhaseIdx);
-                auto so = fs.saturation(oilPhaseIdx);
-                auto rv = fs.Rv();
-                auto rs = fs.Rs();
-                if (isnan(in(0 * well_size + i))){
-                    std::cout << "INPUT Po BIG ISSUE: "<< i << in(0 * well_size + i) << po << std::endl;
-                }
-                if (isnan(in(1 * well_size + i))){
-                    std::cout << "INPUT SW BIG ISSUE: "<< i << in(1 * well_size + i) << sw << std::endl;
-                    std::cout << "SCALER SW:" << scaler_params_list[0].at("data_min_")[1] << scaler_params_list[0].at("data_max_")[1] << std::endl;
-                }
-                if (isnan(in(2 * well_size + i))){
-                    std::cout << "INPUT SO BIG ISSUE: "<< i << in(2 * well_size + i) << so <<std::endl;
-                }
-                if (isnan(in(3 * well_size + i))){
-                    std::cout << "INPUT RV BIG ISSUE: "<< i << in(3 * well_size + i) << rv << std::endl;
-                }
-                if (isnan(in(4 * well_size + i))){
-                    std::cout << "INPUT RS BIG ISSUE: "<< i << in(4 * well_size + i) << rs << std::endl;
-                }
-                if (isnan(in(5 * well_size + i))){
-                    std::cout << "INPUT K BIG ISSUE: "<< i << in(5 * well_size + i) << permX[i] << std::endl;
-                }
-            }
             Tensor<Evaluation> out{1, 5 * well_size};
             model.apply(in, out);
-
-            // for (int i = 0; i < 5 * well_size; ++i){
-            //     if (isnan(out(i))){
-            //         std::cout << "OUTPUT BIG ISSUE: "<< i << std::endl;
-            //     }
-            // }
 
             for (int i = 0; i < well_size; ++i){
                 const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
@@ -643,7 +579,7 @@ public:
                 Evaluation sw_pred; 
                 Evaluation so_pred; 
 
-                auto po_pred = pow(10,  scaler_params_list[1].at("data_min_")[0] + out(0 * well_size + i) * (scaler_params_list[1].at("data_max_")[0] - scaler_params_list[1].at("data_min_")[0])) * Opm::unit::barsa;
+                // auto po_pred = pow(10,  scaler_params_list[1].at("data_min_")[0] + out(0 * well_size + i) * (scaler_params_list[1].at("data_max_")[0] - scaler_params_list[1].at("data_min_")[0])) * Opm::unit::barsa;
                 if (scaler_params_list[0].at("data_min_")[1] != scaler_params_list[0].at("data_max_")[1]){
                     if (getValue(fs.saturation(waterPhaseIdx)) > 0.){
                         sw_pred = max(scaler_params_list[1].at("data_min_")[1] + out(1 * well_size + i) * (scaler_params_list[1].at("data_max_")[1] - scaler_params_list[1].at("data_min_")[1]), 0.);
