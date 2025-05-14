@@ -71,6 +71,11 @@
 
 #include <opm/utility/CopyablePtr.hpp>
 
+#include <opm/ml/ml_model.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
+#include <unordered_map>
+
 #include <algorithm>
 #include <cstddef>
 #include <functional>
@@ -78,6 +83,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <fmt/core.h> 
+#include <utility>
 
 namespace Opm {
 
@@ -366,10 +373,203 @@ public:
             this->model().linearizer().updateBoundaryConditionData();
         }
 
+        //----- Hybrid Newton ---- 
+         
+        auto& eclState = this->simulator().vanguard().eclState();
+        auto& fp = eclState.fieldProps();
+        
+        auto permX = fp.get_double("PERMX");
+
+        std::vector<std::string> names;
+        std::string wells_filename = "En_ml_models/well_models_ready.json";
+        std::ifstream wells_ready(wells_filename);
+        if (wells_ready.is_open()){
+            boost::property_tree::ptree pt;
+            try {
+                boost::property_tree::read_json(wells_ready, pt);
+            } catch (boost::property_tree::json_parser::json_parser_error& e) {
+                OPM_THROW(std::logic_error, "Error cannot parse json file '" + wells_filename + "'");
+            }
+            for (const auto& item : pt) {
+                names.push_back(item.second.get_value<std::string>());
+            }
+        } else {
+            names = {};
+        }
+        wells_ready.close();
+
         wellModel_.beginTimeStep();
         aquiferModel_.beginTimeStep();
         tracerModel_.beginTimeStep();
 
+         // Well finding
+         std::vector<std::string> presentNames;
+         for (const auto& name : names) {
+         if (wellModel_.hasLocalWell(name)) {
+             presentNames.push_back(name);
+             }
+         }
+
+         std::unordered_map<std::string, std::pair<float, float>> well_openings = {
+            {"A2", {68., 68.}},
+            {"C-1H", {1321., 1321.}},
+        };
+
+        float current_time = this->simulator().time();
+        std::vector<std::string> matching_wells;
+        for (const auto& well_name : names) {
+            // Check if the well name exists in well_openings
+            auto it = well_openings.find(well_name);
+            if (it != well_openings.end()) {
+                // Get the interval and check if current_time falls within it
+                auto [start_time, end_time] = it->second; // Destructure the pair
+                float current_time_in_days = current_time / (60 * 60 * 24);
+                if (current_time_in_days >= start_time && current_time_in_days <= end_time) {
+                    // If current time is within the interval, save the well name
+                    matching_wells.push_back(well_name);
+                }
+            }
+        }
+        for (const auto& name : matching_wells) {
+            std::cout << "Using well model " << name << std::endl; 
+            const auto& ws = wellModel_.wellState()[name];
+            Scalar resv = std::accumulate(ws.reservoir_rates.begin(), ws.reservoir_rates.end(), 0.);
+
+            // Load well local domain
+            std::string fileName = fmt::format("En_ml_data/{}_local_domain.csv", name);
+            std::ifstream file(fileName);
+            std::string line;
+            std::getline(file, line);
+            file.close();
+            // Extract cell indexes from file
+            std::vector<int> well_cell_indexes;
+            std::stringstream ss(line);
+            // Find the substring containing the integers
+            std::string substr;
+            while (std::getline(ss, substr, '[') && !ss.eof());
+            // Extract integers from the substring
+            std::stringstream int_ss(substr);
+            int num;
+            while (int_ss >> num) {
+                well_cell_indexes.push_back(num);
+                if (int_ss.peek() == ',') {
+                    int_ss.ignore();
+                }
+            }
+
+            // Scaler loading and finding
+            std::vector<std::string> filenames_json = {
+                fmt::format("En_ml_models/scalers/{}/X_scaler.json", name),
+                fmt::format("En_ml_models/scalers/{}/Y_scaler.json", name),
+                fmt::format("En_ml_models/scalers/{}/dt_scaler.json", name),
+                fmt::format("En_ml_models/scalers/{}/RESV_scaler.json", name),
+            };
+
+            std::vector<std::unordered_map<std::string, std::vector<double>>> scaler_params_list;
+            for (const auto& filename_json : filenames_json) {
+                std::ifstream file_json(filename_json);
+                boost::property_tree::ptree pt;
+                try {
+                    boost::property_tree::read_json(file_json, pt);
+                } catch (boost::property_tree::json_parser::json_parser_error& e) {
+                    OPM_THROW(std::logic_error, "Error cannot parse json file '" + filename_json + "'");
+                }
+                file_json.close();
+                std::unordered_map<std::string, std::vector<double>> scaler_params;
+                for (const auto& item : pt) {
+                    std::vector<double> values;
+                    for (const auto& value : item.second) {
+                        values.push_back(value.second.get_value<double>());
+                    }
+                    scaler_params[item.first] = values;
+                }
+                scaler_params_list.push_back(scaler_params);
+            }
+
+            int well_size = well_cell_indexes.size();
+
+            Opm::ML::NNModel<Evaluation> model;
+            std::string modelFileName = fmt::format("En_ml_models/{}.model", name);
+            model.loadModel(modelFileName);
+            Opm::ML::Tensor<Evaluation> in{6 * well_size + 2};
+
+            for (int i = 0; i < well_size; ++i){
+                const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
+                auto fs = intQuants.fluidState();
+                auto po = fs.pressure(oilPhaseIdx);
+                auto sw = fs.saturation(waterPhaseIdx);
+                auto so = fs.saturation(oilPhaseIdx);
+                auto rv = fs.Rv();
+                auto rs = fs.Rs();
+
+                in(0 * well_size + i) =  max(0., min(1., (log10(1e-7 + po / Opm::unit::barsa) - scaler_params_list[0].at("data_min_")[0]) / (scaler_params_list[0].at("data_max_")[0] - scaler_params_list[0].at("data_min_")[0])));
+
+                if (scaler_params_list[0].at("data_min_")[1] == scaler_params_list[0].at("data_max_")[1]){
+                    in(1 * well_size + i) = scaler_params_list[0].at("data_min_")[1];
+                } else{
+                    in(1 * well_size + i) = max(0., min(1., (sw  - scaler_params_list[0].at("data_min_")[1]) / (scaler_params_list[0].at("data_max_")[1] - scaler_params_list[0].at("data_min_")[1])));
+                }
+                if (scaler_params_list[0].at("data_min_")[2] == scaler_params_list[0].at("data_max_")[2]){
+                    in(2 * well_size + i) = scaler_params_list[0].at("data_min_")[2];
+                } else{
+                    in(2 * well_size + i) = max(0., min(1., (so  - scaler_params_list[0].at("data_min_")[2]) / (scaler_params_list[0].at("data_max_")[2] - scaler_params_list[0].at("data_min_")[2])));
+                }
+                
+                in(3 * well_size + i) = max(0., min(1., (log10(1e-7 + rv)  - scaler_params_list[0].at("data_min_")[3]) / (scaler_params_list[0].at("data_max_")[3] - scaler_params_list[0].at("data_min_")[3])));
+                in(4 * well_size + i) = max(0., min(1., (log(1. + rs)  - scaler_params_list[0].at("data_min_")[4]) / (scaler_params_list[0].at("data_max_")[4] - scaler_params_list[0].at("data_min_")[4])));
+                in(5 * well_size + i) = max(0., min(1., (log10(1e-7 + permX[well_cell_indexes[i]] / (Opm::prefix::milli*Opm::unit::darcy)) - scaler_params_list[0].at("data_min_")[5]) / (scaler_params_list[0].at("data_max_")[5] - scaler_params_list[0].at("data_min_")[5])));
+            }
+
+            in(6 * well_cell_indexes.size()) = max(0., min(1.,(log10(1e-7 + this->simulator().timeStepSize()) - scaler_params_list[2].at("data_min_")[0]) / (scaler_params_list[2].at("data_max_")[0] - scaler_params_list[2].at("data_min_")[0])));
+            in(6 * well_cell_indexes.size() + 1) = max(0., min(1., (log(1. + abs(resv)) - scaler_params_list[3].at("data_min_")[0]) / (scaler_params_list[3].at("data_max_")[0] - scaler_params_list[3].at("data_min_")[0])));
+
+            Opm::ML::Tensor<Evaluation> out{1, 5 * well_size};
+            model.apply(in, out);
+
+            for (int i = 0; i < well_size; ++i){
+                const auto& intQuants = this->simulator().model().intensiveQuantities(well_cell_indexes[i], /*timeIdx*/ 0);
+                auto fs = intQuants.fluidState();
+                Evaluation sw_pred; 
+                Evaluation so_pred; 
+
+                // auto po_pred = pow(10,  scaler_params_list[1].at("data_min_")[0] + out(0 * well_size + i) * (scaler_params_list[1].at("data_max_")[0] - scaler_params_list[1].at("data_min_")[0])) * Opm::unit::barsa;
+                if (scaler_params_list[0].at("data_min_")[1] != scaler_params_list[0].at("data_max_")[1]){
+                    if (getValue(fs.saturation(waterPhaseIdx)) > 0.){
+                        sw_pred = max(scaler_params_list[1].at("data_min_")[1] + out(1 * well_size + i) * (scaler_params_list[1].at("data_max_")[1] - scaler_params_list[1].at("data_min_")[1]), 0.);
+                    } else {
+                        sw_pred = 0.;
+                    }
+                } else{
+                    sw_pred = scaler_params_list[0].at("data_min_")[1];
+                }
+                if (scaler_params_list[0].at("data_min_")[2] != scaler_params_list[0].at("data_max_")[2]){
+                    if (getValue(fs.saturation(oilPhaseIdx)) > 0.){
+                        so_pred = max(scaler_params_list[1].at("data_min_")[2] + out(2 * well_size + i) * (scaler_params_list[1].at("data_max_")[2] - scaler_params_list[1].at("data_min_")[2]), 0.);
+                    } else {
+                        so_pred = 0.;
+                    }
+                } else{
+                    so_pred = scaler_params_list[0].at("data_min_")[2]; 
+                }
+                auto rv_pred = max(pow(10, scaler_params_list[1].at("data_min_")[3] + out(3 * well_size + i) * (scaler_params_list[1].at("data_max_")[3] - scaler_params_list[1].at("data_min_")[3])) - 1e-7, 0.0); 
+                auto rs_pred = max(exp(scaler_params_list[1].at("data_min_")[4] + out(4 * well_size + i) * (scaler_params_list[1].at("data_max_")[4] - scaler_params_list[1].at("data_min_")[4])) - 1., 0.0);
+                
+                auto sw = max(0., min(sw_pred, 1.));
+                auto so = max(0., min(so_pred, 1.));
+                auto sg = max(0., min(1. - so_pred - sw_pred, 1.));
+                Scalar st = getValue(sw) + getValue(so) + getValue(sg);
+                fs.setSaturation(waterPhaseIdx, getValue(sw)/st);
+                fs.setSaturation(gasPhaseIdx, getValue(sg)/st);
+                fs.setSaturation(oilPhaseIdx, getValue(so)/st);
+                
+                fs.setRv(getValue(rv_pred));
+                fs.setRs(getValue(rs_pred));
+                auto& primaryVars = this->model().solution(/*timeIdx*/0)[well_cell_indexes[i]];
+                primaryVars.assignNaive(fs);
+            }
+            this->model().invalidateAndUpdateIntensiveQuantities(/*timeIdx*/0); 
+        };
+        //     ----- End of Hybrid Newton ---- 
     }
 
     /*!
