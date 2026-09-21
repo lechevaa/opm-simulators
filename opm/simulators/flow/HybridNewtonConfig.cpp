@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 
 namespace Opm {
@@ -39,12 +40,17 @@ HybridNewtonConfig::HybridNewtonConfig(const PropertyTree& model_config)
         throw std::runtime_error("Missing 'model_path' in HybridNewton config");
     }
 
+    model_data_type = model_config.get<std::string>("model_data_type", "float32");
+    if (model_data_type != "float32" && model_data_type != "float64") {
+        throw std::runtime_error("Invalid 'model_data_type' in HybridNewton config: " + model_data_type +
+                                 " (expected 'float32' or 'float64')");
+    }
+
     cell_indices_file = model_config.get<std::string>("cell_indices_file", "");
     if (cell_indices_file.empty()) {
         throw std::runtime_error("Missing 'cell_indices_file' in HybridNewton config");
     }
 
-    // Load cell indices immediately
     cell_indices = loadCellIndicesFromFile(cell_indices_file);
     n_cells = cell_indices.size();
 
@@ -62,9 +68,24 @@ HybridNewtonConfig::HybridNewtonConfig(const PropertyTree& model_config)
         throw std::runtime_error("'apply_times' must contain at least one value");
     }
 
+    apply_start_time = model_config.get<double>("apply_start_time", std::numeric_limits<double>::quiet_NaN());
+    apply_end_time = model_config.get<double>("apply_end_time", std::numeric_limits<double>::quiet_NaN());
+    apply_dt = model_config.get<double>("apply_dt", std::numeric_limits<double>::quiet_NaN());
+    apply_report_step = model_config.get<int>("apply_report_step", -1);
+    apply_current_step = model_config.get<int>("apply_current_step", -1);
+
+    output_values_are_si = model_config.get<bool>("output_values_are_si", false);
     // Parse features
     parseFeatures(model_config, "features.inputs", input_features);
     parseFeatures(model_config, "features.outputs", output_features);
+
+    if (auto fixedOutputsOpt = model_config.get_child_optional("fixed_output_values")) {
+        for (const auto& name : fixedOutputsOpt->get_child_keys()) {
+            if (auto values = fixedOutputsOpt->get_child_items_as_vector<double>(name)) {
+                fixed_output_values.emplace(name, std::move(*values));
+            }
+        }
+    }
 }
 
 bool HybridNewtonConfig::hasInputFeature(const std::string& name) const
@@ -95,6 +116,7 @@ void HybridNewtonConfig::validateConfig(bool compositionSwitchEnabled) const
             "CompositionSwitch must be enabled for RS/RV features."
         );
     }
+
 }
 
 std::vector<int>
@@ -159,6 +181,7 @@ parseFeatures(const PropertyTree& pt, const std::string& path,
 
         spec.is_delta = name.compare(0, 6, "DELTA_") == 0;
         spec.actual_name = spec.is_delta ? name.substr(6) : name;
+        spec.vector_size = ft.get<std::size_t>("size", 0);
 
         features.emplace_back(name, std::move(spec));
     }

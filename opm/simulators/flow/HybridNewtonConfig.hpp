@@ -23,6 +23,7 @@
 #define HYBRID_NEWTON_CONFIG_HPP
 
 #include <cmath>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -121,6 +122,7 @@ struct FeatureSpec
     Transform transform;
     Scaler scaler;
     bool is_delta = false;
+    std::size_t vector_size = 0;
     std::string actual_name;
 
     FeatureSpec() = default;
@@ -136,12 +138,20 @@ class HybridNewtonConfig
 {
 public:
     std::string model_path;
+    std::string model_data_type = "float32";
     std::string cell_indices_file;
     std::vector<int> cell_indices;
     std::size_t n_cells = 0;
     std::vector<double> apply_times;
+    double apply_start_time = std::numeric_limits<double>::quiet_NaN();
+    double apply_end_time = std::numeric_limits<double>::quiet_NaN();
+    double apply_dt = std::numeric_limits<double>::quiet_NaN();
+    int apply_report_step = -1;
+    int apply_current_step = -1;
     std::vector<std::pair<std::string, FeatureSpec>> input_features;
     std::vector<std::pair<std::string, FeatureSpec>> output_features;
+    std::map<std::string, std::vector<double>> fixed_output_values;
+    bool output_values_are_si = false;
 
     // Default constructor
     HybridNewtonConfig() = default;
@@ -157,6 +167,11 @@ public:
     bool hasInputFeature(const std::string& name) const;
 
     bool hasOutputFeature(const std::string& name) const;
+
+    bool hasFixedOutputValues() const
+    {
+        return !fixed_output_values.empty();
+    }
 
     /*!
     * \brief Validate feature compatibility with simulator settings.

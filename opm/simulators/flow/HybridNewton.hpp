@@ -25,11 +25,19 @@
 
 #include <opm/simulators/flow/FlowBaseProblemProperties.hpp>
 #include <opm/simulators/flow/HybridNewtonConfig.hpp>
+#include <opm/simulators/flow/HybridNewtonReservoirInit.hpp>
 #include <opm/input/eclipse/Units/UnitSystem.hpp>
+#include <opm/models/blackoil/blackoilnewtonmethodparams.hpp>
 
 #include <opm/ml/ml_model.hpp>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
+#include <functional>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace Opm {
@@ -76,6 +84,7 @@ protected:
 public:
     explicit BlackOilHybridNewton(Simulator& simulator)
         : simulator_(simulator)
+        , reservoirInit_(simulator)
         , configsLoaded_(false)
     {}
 
@@ -98,33 +107,44 @@ public:
     */
     void tryApplyHybridNewton()
     {
-        // Check if flag activated
+        tryApplyReservoirHybridNewton();
+    }
+
+    void tryApplyReservoirHybridNewton()
+    {
         if (!Parameters::Get<Parameters::UseHybridNewton>())
             return;
 
         validateFluidSystem();
 
-        if (!configsLoaded_) {
-            std::string config_file = Parameters::Get<Parameters::HybridNewtonConfigFile>();
-            PropertyTree pt(config_file);
-            for (const auto& model_key : pt.get_child_keys()) {
-                HybridNewtonConfig config(pt.get_child(model_key));
-                config.validateConfig(compositionSwitchEnabled);
-                configs_.push_back(std::move(config));
-            }
-            configsLoaded_ = true;
-        }
+        loadConfigsIfNeeded();
 
         Scalar current_time = simulator_.time();
-        // Find and apply all models that should run at this time
         for (const auto& config : configs_) {
-            if (shouldApplyHybridNewton(current_time, config)) {
-                runHybridNewton(config);
+            const bool should_apply = shouldApplyHybridNewton(current_time, config);
+            if (should_apply) {
+                runReservoirHybridNewton(config);
             }
         }
     }
 
 private:
+    void loadConfigsIfNeeded()
+    {
+        if (configsLoaded_) {
+            return;
+        }
+
+        std::string config_file = Parameters::Get<Parameters::HybridNewtonConfigFile>();
+        PropertyTree pt(config_file);
+        for (const auto& model_key : pt.get_child_keys()) {
+            HybridNewtonConfig config(pt.get_child(model_key));
+            config.validateConfig(compositionSwitchEnabled);
+            configs_.push_back(std::move(config));
+        }
+        configsLoaded_ = true;
+    }
+
     /*!
     * \brief Apply the Hybrid Newton method using a given model configuration.
     *
@@ -139,11 +159,19 @@ private:
     * \throws std::runtime_error if cell indices cannot be loaded or if
     *         feature extraction or application fails.
     */
-    void runHybridNewton(const HybridNewtonConfig& config)
+    void runReservoirHybridNewton(const HybridNewtonConfig& config)
     {
-        auto input  = constructInputTensor(config);
-        auto output = constructOutputTensor(input, config);
-        updateInitialGuess(output, config);
+        reservoirInit_.runReservoirHybridNewton(
+            config,
+            std::bind(&BlackOilHybridNewton::constructInputTensor, this, std::placeholders::_1),
+            std::bind(&BlackOilHybridNewton::constructOutputTensor, this, std::placeholders::_1, std::placeholders::_2),
+            [](const HybridNewtonConfig& current_config,
+               const ML::Tensor<Evaluation>& input,
+               const ML::Tensor<Evaluation>& output) {
+                (void)current_config;
+                (void)input;
+                (void)output;
+            });
     }
 
 protected:
@@ -186,9 +214,37 @@ protected:
     */
     bool shouldApplyHybridNewton(Scalar current_time, const HybridNewtonConfig& config) const
     {
+        constexpr Scalar tolerance = 1e-6;
+        const Scalar current_dt = simulator_.timeStepSize();
+        const Scalar current_end_time = current_time + current_dt;
+
+        if (!std::isnan(config.apply_dt) &&
+            std::abs(current_dt - config.apply_dt) >= tolerance) {
+            return false;
+        }
+
+        if (!std::isnan(config.apply_start_time) &&
+            std::abs(current_time - config.apply_start_time) >= tolerance) {
+            return false;
+        }
+
+        if (!std::isnan(config.apply_end_time) &&
+            std::abs(current_end_time - config.apply_end_time) >= tolerance) {
+            return false;
+        }
+
+        if (config.apply_report_step >= 0 &&
+            simulator_.episodeIndex() != config.apply_report_step) {
+            return false;
+        }
+
+        if (config.apply_current_step >= 0 &&
+            simulator_.timeStepIndex() != config.apply_current_step) {
+            return false;
+        }
+
         if (config.apply_times.size() == 1) {
             // Apply exactly at one point in time (with optional tolerance)
-            constexpr Scalar tolerance = 1e-6;
             bool apply = std::abs(current_time - config.apply_times[0]) < tolerance;
             return apply;
         }
@@ -376,12 +432,15 @@ protected:
                           const HybridNewtonConfig& config)
     {
         const auto& features = config.output_features;
-        const int n_features = features.size();
+        const std::size_t output_tensor_length = config.n_cells * features.size();
 
         ML::NNModel<Evaluation> model;
-        model.loadModel(config.model_path);
+        const auto data_type = (config.model_data_type == "float64")
+            ? ML::ModelDataType::kFloat64
+            : ML::ModelDataType::kFloat32;
+        model.loadModel(config.model_path, data_type);
 
-        ML::Tensor<Evaluation> output(1, config.n_cells * n_features);
+        ML::Tensor<Evaluation> output(1, output_tensor_length);
         model.apply(input, output);
 
         return output;
@@ -414,164 +473,9 @@ protected:
     * \throws std::runtime_error if an unknown output feature is encountered
     *         or if state consistency cannot be enforced.
     */
-    void updateInitialGuess(ML::Tensor<Evaluation>& output,
-                            const HybridNewtonConfig& config)
-    {
-        const auto& features = config.output_features;
-
-        FeatureFlags flags = flagFeatures(features);
-
-        const auto& unitSyst = simulator_.vanguard().schedule().getUnits();
-
-        for (std::size_t i = 0; i < config.n_cells; ++i) {
-            const int cell_idx = config.cell_indices[i];
-            const auto& intQuants = simulator_.model().intensiveQuantities(cell_idx, /*timeIdx*/0);
-            auto fs = intQuants.fluidState();
-
-            int feature_idx = 0;
-
-            // Temp variables per cell
-            Scalar sw_val = -1.0;
-            Scalar so_val = -1.0;
-            Scalar sg_val = -1.0;
-            Scalar po_val = -1.0;
-
-            for (const auto& [name, spec] : features) {
-
-                auto scaled_value = getValue(output(feature_idx * config.n_cells + i));
-
-                // Inverse scaling
-                Scalar raw_value = spec.scaler.unscale(scaled_value);
-
-                // Inverse transform
-                raw_value = spec.transform.applyInverse(raw_value);
-
-                if (spec.is_delta) {
-                    if (spec.actual_name == "PRESSURE") {
-                        raw_value = raw_value + unitSyst.from_si(UnitSystem::measure::pressure, getValue(fs.pressure(oilPhaseIdx)));
-                    } else if (spec.actual_name == "SWAT") {
-                        raw_value += getValue(fs.saturation(waterPhaseIdx));
-                    } else if (spec.actual_name == "SOIL") {
-                        raw_value += getValue(fs.saturation(oilPhaseIdx));
-                    } else if (spec.actual_name == "SGAS") {
-                        raw_value += getValue(fs.saturation(gasPhaseIdx));
-                    } else if (spec.actual_name == "RS") {
-                        raw_value = raw_value + unitSyst.from_si(UnitSystem::measure::gas_oil_ratio, getValue(fs.Rs()));
-                    } else if (spec.actual_name == "RV") {
-                        raw_value = raw_value + unitSyst.from_si(UnitSystem::measure::oil_gas_ratio, getValue(fs.Rv()));
-                    } else {
-                        OPM_THROW(std::runtime_error, "Unknown delta feature: " + name);
-                    }
-                }
-
-                if (spec.actual_name == "PRESSURE") {
-                    po_val = unitSyst.to_si(UnitSystem::measure::pressure, raw_value);
-                } else if (spec.actual_name == "SWAT") {
-                    sw_val = raw_value;
-                } else if (spec.actual_name == "SOIL") {
-                    so_val = raw_value;
-                } else if (spec.actual_name == "SGAS") {
-                    sg_val = raw_value;
-                } else if (spec.actual_name == "RS") {
-                    if constexpr (compositionSwitchEnabled) {
-                        raw_value = unitSyst.to_si(UnitSystem::measure::gas_oil_ratio, raw_value);
-                        fs.setRs(raw_value);
-                    }
-                } else if (spec.actual_name == "RV") {
-                    if constexpr (compositionSwitchEnabled) {
-                        raw_value = unitSyst.to_si(UnitSystem::measure::oil_gas_ratio, raw_value);
-                        fs.setRv(raw_value);
-                    }
-                } else {
-                    OPM_THROW(std::runtime_error, "Unknown output feature: " + name);
-                }
-
-                ++feature_idx;
-            }
-
-            int sat_count = static_cast<int>(flags.has_SWAT) +
-                            static_cast<int>(flags.has_SOIL) +
-                            static_cast<int>(flags.has_SGAS);
-
-            if (sat_count >= 2) {
-                Scalar sw = sw_val;
-                Scalar so = so_val;
-                Scalar sg = sg_val;
-
-                if (!flags.has_SWAT) {
-                    sw = 1.0 - so - sg;
-                } else if (!flags.has_SOIL) {
-                    so = 1.0 - sw - sg;
-                } else if (!flags.has_SGAS) {
-                    sg = 1.0 - sw - so;
-                }
-
-                sw = max(0.0, min(sw, 1.0));
-                so = max(0.0, min(so, 1.0));
-                sg = max(0.0, min(sg, 1.0));
-
-                Scalar sum = sw + so + sg;
-                if (sum <= 1e-12) {
-                    OPM_THROW(std::runtime_error, "Saturation sum is zero in cell " + std::to_string(cell_idx));
-                }
-
-                fs.setSaturation(waterPhaseIdx, sw / sum);
-                fs.setSaturation(oilPhaseIdx,   so / sum);
-                fs.setSaturation(gasPhaseIdx,   sg / sum);
-            }
-
-            if (flags.has_PRESSURE) {
-                std::array<Evaluation, numPhases> pC;
-                const auto& materialParams = simulator_.problem().materialLawParams(cell_idx);
-                MaterialLaw::capillaryPressures(pC, materialParams, fs);
-
-                for (unsigned phaseIdx = 0; phaseIdx < numPhases; ++phaseIdx) {
-                    if (!FluidSystem::phaseIsActive(phaseIdx)) continue;
-                    if (phaseIdx == oilPhaseIdx) {
-                        fs.setPressure(phaseIdx, po_val);
-                    } else {
-                        fs.setPressure(phaseIdx, po_val - pC[phaseIdx]);
-                    }
-                }
-            }
-
-            auto& primaryVars = simulator_.model().solution(/*timeIdx*/0)[cell_idx];
-            primaryVars.assignNaive(fs);
-        }
-
-        simulator_.model().invalidateAndUpdateIntensiveQuantities(/*timeIdx*/0);
-    }
-
-    struct FeatureFlags
-    {
-        bool has_SWAT = false;
-        bool has_SOIL = false;
-        bool has_SGAS = false;
-        bool has_PRESSURE = false;
-    };
-
-    FeatureFlags flagFeatures(const std::vector<std::pair<std::string, FeatureSpec>>& features)
-    {
-        FeatureFlags flags;
-
-        for (const auto& [name, spec] : features) {
-
-            if (spec.actual_name == "SWAT") {
-                flags.has_SWAT = true;
-            } else if (spec.actual_name == "SOIL") {
-                flags.has_SOIL = true;
-            } else if (spec.actual_name == "SGAS") {
-                flags.has_SGAS = true;
-            } else if (spec.actual_name == "PRESSURE") {
-                flags.has_PRESSURE = true;
-            }
-        }
-
-        return flags;
-    }
-
 protected:
     Simulator& simulator_;
+    BlackOilHybridNewtonReservoirInit<TypeTag> reservoirInit_;
     std::vector<HybridNewtonConfig> configs_;
     bool configsLoaded_;
 };

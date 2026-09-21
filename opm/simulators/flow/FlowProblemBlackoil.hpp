@@ -294,7 +294,7 @@ public:
     void beginTimeStep() override
     {
         FlowProblemType::beginTimeStep();
-        hybridNewton_.tryApplyHybridNewton();
+        hybridNewton_.tryApplyReservoirHybridNewton();
     }
 
     /*!
