@@ -146,3 +146,62 @@ See the companion training script outline in [NeuralCPRPolicy](NeuralCPRPolicy.m
 The data-collection sweep uses the existing `--linear-solver=cpr_trueimpes`,
 `--linear-solver=cpr_quasiimpes`, and `--linear-solver=cprw` flags to evaluate
 all config combinations on benchmark decks.  Labels are wall-time-per-linear-solve.
+
+## Reproducible CPR+AMG+reuse study
+
+The current deployable model uses the reduced 12-label CPR space, nine AMG
+settings, and six reuse intervals.  A complete sweep therefore runs
+`12 × 3 × 3 × 6 = 648` simulations per deck.  The sweep is independent across
+decks and can be distributed with `--jobs`:
+
+```bash
+NEURAL_CPR=$PWD/opm-simulators/doc/neural_cpr
+FLOW=$PWD/build/opm-simulators/bin/flow
+OUT=$PWD/results/full_joint_sweep
+
+python3 "$NEURAL_CPR/run_sweep.py" \
+  --flow "$FLOW" \
+  --decks "$PWD/decks/spe9/SPE9.DATA" \
+         "$PWD/decks/norne/NORNE_ATW2013.DATA" \
+         "$PWD/decks/spe11_decks/SPE11A/SPE11A.DATA" \
+  --out "$OUT" --jobs 8 \
+  --joint-cpr-amg --cpr-type cprw \
+  --amg-dampings 1.0 1.3 1.6 \
+  --amg-targets 300 600 1200 \
+  --reuse-intervals 8 16 32 64 128 256
+```
+
+Use the exact deck paths available in the checkout.  The output CSVs are
+written directly under `$OUT`; each file contains one simulation's segment
+measurements.  `--jobs` should match the number of independent serial slots on
+the cluster, not the total number of cores on a multi-rank job.
+
+Train one combined model from all decks:
+
+```bash
+python3 "$NEURAL_CPR/train_hierarchical_cpr_amg_reuse.py" \
+  --csv-glob "$OUT/*_label_*_pd*_ct*_ri*.csv" \
+  --out-prefix "$OUT/neural_cpr_amg_reuse"
+```
+
+The loader keeps deck identity, checks that every segment has the complete
+`12 × 9 × 6` action grid, and holds out the last 15% of segments from every
+deck for validation.  NumPy is required for training; Matplotlib is optional
+and is used only for the training plot.
+
+Export the trained model for Flow:
+
+```bash
+python3 "$NEURAL_CPR/export_hierarchical_binary.py" \
+  --input "$OUT/neural_cpr_amg_reuse_model.npz" \
+  --output "$OUT/neural_cpr_amg_reuse.model"
+```
+
+Deploy it with dynamic reuse selection:
+
+```bash
+OPM_NEURAL_CPR_WEIGHTS="$OUT/neural_cpr_amg_reuse.model" \
+OPM_NEURAL_CPR_ACTIONS=hierarchical \
+flow --linear-solver=cprw --cpr-reuse-setup=4 \
+     --cpr-reuse-interval=32 --output-dir="$OUT/deployment" DECK.DATA
+```

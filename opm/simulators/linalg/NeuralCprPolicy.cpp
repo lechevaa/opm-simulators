@@ -122,17 +122,18 @@ bool NeuralCprPolicy::scores(const CprPolicyFeatures& feat,
 
     auto arr = feat.toArray();
     Opm::ML::Tensor<float> in(model_input_size_);
+    static constexpr int active8[] = {0, 1, 2, 3, 4, 6, 7, 8};
     for (int i = 0; i < model_input_size_; ++i)
-        in(i) = arr[i];
+        in(i) = (model_input_size_ == 8) ? arr[active8[i]] : arr[i];
 
     Opm::ML::Tensor<float> res;
     if (!model_.apply(in, res) || static_cast<int>(res.data_.size()) < 24)
         return false;
-    out.assign(res.data_.begin(), res.data_.begin() + 24);
+    out.assign(res.data_.begin(), res.data_.end());
 
     // Forbidden labels get -inf so they are never selected by argmax or
     // included in the softmax normalisation sum.
-    for (int i = 0; i < 24; ++i) {
+    for (int i = 0; i < std::min(24, static_cast<int>(out.size())); ++i) {
         if (forbidden_mask_ & (1u << i))
             out[i] = -std::numeric_limits<float>::infinity();
     }
@@ -146,6 +147,30 @@ CprPolicyAction NeuralCprPolicy::predict(const CprPolicyFeatures& feat,
     if (!scores(feat, out)) {
         if (out_confidence) *out_confidence = 1.0f;
         return ruleBasedPredict(feat);
+    }
+
+    if (out.size() >= 768) {
+        // Hierarchical model: CPR(12), AMG(12x9), reuse(12x9x6).
+        int bestC = 0, bestA = 0, bestR = 0;
+        float best = -std::numeric_limits<float>::infinity();
+        std::array<int, 3> cands{};
+        std::array<float, 12> cs{};
+        for (int c = 0; c < 12; ++c) cs[c] = out[c];
+        std::array<int, 12> order{}; for (int c=0;c<12;++c) order[c]=c;
+        std::partial_sort(order.begin(), order.begin()+3, order.end(),
+                          [&](int a,int b){return cs[a]>cs[b];});
+        for (int ci=0; ci<3; ++ci) {
+            const int c=order[ci];
+            std::array<int,9> ao{}; for(int a=0;a<9;++a) ao[a]=a;
+            std::partial_sort(ao.begin(),ao.begin()+3,ao.end(),[&](int a,int b){return out[12+c*9+a]>out[12+c*9+b];});
+            for(int ai=0;ai<3;++ai) { const int a=ao[ai];
+                for(int r=0;r<6;++r) { const float s=out[120+(c*9+a)*6+r];
+                    if(s>best){best=s;bestC=c;bestA=a;bestR=r;}
+                }
+            }
+        }
+        if (out_confidence) *out_confidence = 1.0f;
+        return actionFromReducedLabel(bestC);
     }
 
     if (out_confidence) {
@@ -189,6 +214,18 @@ std::pair<int, int> NeuralCprPolicy::chooseAmgAnchored(const CprPolicyFeatures& 
     if (!valid_)
         return {0, 0};
 
+    std::vector<float> hierarchical;
+    if (scores(feat, hierarchical) && hierarchical.size() >= 768) {
+        float best = -std::numeric_limits<float>::infinity(); int bc=0, ba=0;
+        std::array<int,12> co{}; for(int c=0;c<12;++c) co[c]=c;
+        std::partial_sort(co.begin(),co.begin()+3,co.end(),[&](int x,int y){return hierarchical[x]>hierarchical[y];});
+        for(int ci=0;ci<3;++ci){int c=co[ci]; std::array<int,9> ao{}; for(int a=0;a<9;++a)ao[a]=a;
+            std::partial_sort(ao.begin(),ao.begin()+3,ao.end(),[&](int x,int y){return hierarchical[12+c*9+x]>hierarchical[12+c*9+y];});
+            for(int ai=0;ai<3;++ai){int a=ao[ai]; for(int r=0;r<6;++r){float s=hierarchical[120+(c*9+a)*6+r]; if(s>best){best=s;bc=c;ba=a;}}}
+        }
+        if(out_gain)*out_gain=0.0f; return {ba/3, ba%3};
+    }
+
     // No forbidden-label mask here: the outputs are AMG parameter levels.
     auto arr = feat.toArray();
     Opm::ML::Tensor<float> in(model_input_size_);
@@ -222,6 +259,51 @@ std::pair<int, int> NeuralCprPolicy::chooseAmgAnchored(const CprPolicyFeatures& 
     return (std::isfinite(gain) && gain > min_gain) ? best : std::pair<int, int>{0, 0};
 }
 
+int NeuralCprPolicy::predictReuseInterval(const CprPolicyFeatures& feat,
+                                          int current_interval) const
+{
+    if (!valid_)
+        return current_interval;
+
+    std::vector<float> hierarchical;
+    if (scores(feat, hierarchical) && hierarchical.size() >= 768) {
+        float best = -std::numeric_limits<float>::infinity(); int br=2;
+        std::array<int,12> co{}; for(int c=0;c<12;++c)co[c]=c;
+        std::partial_sort(co.begin(),co.begin()+3,co.end(),[&](int x,int y){return hierarchical[x]>hierarchical[y];});
+        for(int ci=0;ci<3;++ci){int c=co[ci]; std::array<int,9> ao{}; for(int a=0;a<9;++a)ao[a]=a;
+            std::partial_sort(ao.begin(),ao.begin()+3,ao.end(),[&](int x,int y){return hierarchical[12+c*9+x]>hierarchical[12+c*9+y];});
+            for(int ai=0;ai<3;++ai){int a=ao[ai]; for(int r=0;r<6;++r){float s=hierarchical[120+(c*9+a)*6+r]; if(s>best){best=s;br=r;}}}
+        }
+        return kHierarchicalReuseIntervals[br];
+    }
+
+    auto arr = feat.toArray();
+    Opm::ML::Tensor<float> in(model_input_size_);
+    for (int i = 0; i < model_input_size_; ++i)
+        in(i) = arr[i];
+
+    Opm::ML::Tensor<float> res;
+    if (!model_.apply(in, res))
+        return current_interval;
+
+    constexpr int config_outputs = 24;
+    const bool legacy_head = res.data_.size() >= config_outputs + kLegacyReuseIntervals.size();
+    if (legacy_head) {
+        const auto begin = res.data_.begin() + config_outputs;
+        const int choice = static_cast<int>(std::max_element(
+            begin, begin + kLegacyReuseIntervals.size()) - begin);
+        return kLegacyReuseIntervals[choice];
+    }
+    const int n_intervals = static_cast<int>(kReuseIntervals.size());
+    if (static_cast<int>(res.data_.size()) < config_outputs + n_intervals)
+        return current_interval; // Backward-compatible with existing models.
+
+    const auto begin = res.data_.begin() + config_outputs;
+    const auto end   = begin + n_intervals;
+    const int choice = static_cast<int>(std::max_element(begin, end) - begin);
+    return kReuseIntervals[choice];
+}
+
 CprPolicyAction NeuralCprPolicy::decodeLogits(const std::vector<float>& logits)
 {
     // Forbidden labels have been set to -inf before this call.
@@ -247,6 +329,20 @@ CprPolicyAction NeuralCprPolicy::actionFromLabel(int idx)
     act.use_cprw        = (cprw   == 1);
     act.fine_smoother   = (fine   == 0) ? CprSmoother::ParOverILU0 : CprSmoother::DILU;
     act.coarse_smoother = (coarse == 0) ? CprSmoother::ILU0        : CprSmoother::DILU;
+    return act;
+}
+
+CprPolicyAction NeuralCprPolicy::actionFromReducedLabel(int idx)
+{
+    // Reduced 12-label space: weight(3) × fine smoother(2) × coarse smoother(2).
+    CprPolicyAction act;
+    const int dec = idx / 4;
+    act.use_cprw = true;
+    act.weight_type = dec == 0 ? CprWeightType::QuasiIMPES
+                       : (dec == 1 ? CprWeightType::TrueIMPES
+                                   : CprWeightType::TrueIMPESAnalytic);
+    act.fine_smoother = ((idx / 2) % 2 == 0) ? CprSmoother::ParOverILU0 : CprSmoother::DILU;
+    act.coarse_smoother = (idx % 2 == 0) ? CprSmoother::ILU0 : CprSmoother::DILU;
     return act;
 }
 

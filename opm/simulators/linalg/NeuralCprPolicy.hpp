@@ -44,12 +44,19 @@ namespace Opm {
 /// The model file is produced by the companion Python export script using
 /// opm-common's opm.ml.ml_tools.kerasify.export_model().
 ///
-/// MLP architecture: Dense(14→32, relu) → Dense(32→16, relu) → Dense(16→24, linear)
+/// MLP architecture: Dense(19→H, relu) → ... → Dense(H→24+N, linear)
 ///
 /// Output: 24 logits over the joint 3×2×2×2 action space.
 /// Decode: argmax index i → dec=i/8, cprw=(i/4)%2, fine=(i/2)%2, coarse=i%2
 class NeuralCprPolicy {
 public:
+    /// Discrete reuse intervals predicted by the optional extra output head.
+    /// The first 24 model outputs remain the CPR configuration labels.
+    static constexpr std::array<int, 5> kReuseIntervals{16, 32, 64, 128, 256};
+    static constexpr std::array<int, 6> kHierarchicalReuseIntervals{8, 16, 32, 64, 128, 256};
+    /// Mapping retained for previously experimental 30-output models.
+    static constexpr std::array<int, 6> kLegacyReuseIntervals{2, 4, 8, 16, 30, 60};
+
     /// Construct.  If model_path is empty or the file cannot be loaded,
     /// falls back to rule-based prediction (isLoaded() == false).
     explicit NeuralCprPolicy(const std::string& model_path = "");
@@ -60,6 +67,7 @@ public:
     NeuralCprPolicy& operator=(const NeuralCprPolicy&) = delete;
 
     bool isLoaded() const { return valid_; }
+    bool isHierarchical() const { return model_input_size_ == 8; }
 
     /// Forbid a label index (0–23) from ever being selected by predict().
     /// When the model's top logit falls on a forbidden label, the next highest
@@ -95,6 +103,10 @@ public:
     /// receives that predicted gain.
     std::pair<int, int> chooseAmgAnchored(const CprPolicyFeatures& feat, float min_gain,
                                           float* out_gain = nullptr) const;
+
+    /// Predict the next CPR reuse interval from the optional interval head.
+    /// Older 24-output models return current_interval unchanged.
+    int predictReuseInterval(const CprPolicyFeatures& feat, int current_interval) const;
     static constexpr std::array<double, 3> kAmgDamping{1.0, 1.3, 1.6};
     static constexpr std::array<int, 3> kAmgCoarsenTarget{1200, 600, 300};
 
@@ -105,6 +117,7 @@ public:
 
     /// Decode a joint label 0–23 (dec*8 + cprw*4 + fine*2 + coarse).
     static CprPolicyAction actionFromLabel(int label);
+    static CprPolicyAction actionFromReducedLabel(int label);
 
     /// Build a complete PropertyTree mirroring setupCPRW() in
     /// setupPropertyTree.cpp, accepted by FlexibleSolver without modification.

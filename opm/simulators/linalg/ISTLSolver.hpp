@@ -458,7 +458,7 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             // target at each setup rebuild, anchored on the defaults; the CPR
             // variant itself stays as configured.
             if (const char* actions = std::getenv("OPM_NEURAL_CPR_ACTIONS");
-                actions && std::string(actions) == "amg") {
+                actions && (std::string(actions) == "amg" || std::string(actions) == "hierarchical")) {
                 amg_mode_ = true;
                 if (rank0)
                     OpmLog::info("NeuralCprPolicy: choosing AMG prolongation damping and "
@@ -490,10 +490,10 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                            "nl_iteration,nnz_per_row,diag_dominance,"
                            "prev_linsolver_iters,prev_solve_failed,"
                            "time_elapsed_frac,num_cells_log,block_size,"
+                           "well_density,nl_residual_trend,"
+                           "num_phases,dt_cut_count,prev2_linsolver_iters,"
+                           "condition_number_estimate,bhp_well_fraction,"
                            "setup_rebuilt,setup_ms,solve_ms\n";
-                           // "well_density,nl_residual_trend,"
-                           // "num_phases,dt_cut_count,prev2_linsolver_iters,"
-                           // "condition_number_estimate,bhp_well_fraction\n";
                 }
                 OpmLog::info("NeuralCprPolicy: sweep logging to "
                              + std::string(log_path));
@@ -653,16 +653,16 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
                 << last_feat_.time_elapsed_frac    << ","
                 << last_feat_.num_cells_log        << ","
                 << last_feat_.block_size           << ","
+                << last_feat_.well_density         << ","
+                << last_feat_.nl_residual_trend    << ","
+                << last_feat_.num_phases           << ","
+                << last_feat_.dt_cut_count         << ","
+                << last_feat_.prev2_linsolver_iters << ","
+                << last_feat_.condition_number_estimate << ","
+                << last_feat_.bhp_well_fraction    << ","
                 << (last_setup_rebuilt_ ? 1 : 0)   << ","
                 << last_setup_ms_                  << ","
                 << solve_ms                        << "\n";
-                // << last_feat_.well_density               << ","
-                // << last_feat_.nl_residual_trend          << ","
-                // << last_feat_.num_phases                 << ","
-                // << last_feat_.dt_cut_count               << ","
-                // << last_feat_.prev2_linsolver_iters      << ","
-                // << last_feat_.condition_number_estimate  << ","
-                // << last_feat_.bhp_well_fraction          << "\n";
             sweep_log_->flush();
         }
 
@@ -847,7 +847,30 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
 
             const bool rank0 = (simulator_.gridView().comm().rank() == 0);
 
-            if (amg_mode_) {
+            // The existing 24-output models choose only the CPR configuration.
+            // New models may append reuse-interval logits.  Predict the next
+            // interval only at an actual rebuild, so inference has no extra
+            // per-solve cost and the chosen value governs the following reuse
+            // window.
+            if (this->parameters_[activeSolverNum_].cpr_reuse_setup_ == 4) {
+                const int old_reuse_interval =
+                    this->parameters_[activeSolverNum_].cpr_reuse_interval_;
+                int reuse_interval = old_reuse_interval;
+                if (rank0)
+                    reuse_interval = neural_policy_->predictReuseInterval(
+                        feat, reuse_interval);
+                if (isParallel())
+                    simulator_.gridView().comm().broadcast(&reuse_interval, 1, 0);
+                if (reuse_interval > 0) {
+                    this->parameters_[activeSolverNum_].cpr_reuse_interval_ = reuse_interval;
+                    if (rank0 && reuse_interval != old_reuse_interval) {
+                        OpmLog::debug("NeuralCprPolicy reuse interval="
+                                      + std::to_string(reuse_interval));
+                    }
+                }
+            }
+
+            if (amg_mode_ && !neural_policy_->isHierarchical()) {
                 // Choose the AMG parameter levels for the setup about to be
                 // built; the default levels after a failed solve.  Rank 0
                 // decides, all ranks apply the same.
@@ -1148,8 +1171,17 @@ std::unique_ptr<Matrix> blockJacobiAdjacency(const Grid& grid,
             prev2_linsolver_iters_   = cached_linsolver_iters_;  // shift history
             cached_linsolver_iters_  = result.iterations;
 
-            // Check convergence, iterations etc.
-            last_solve_failed_ = !checkConvergence(result);
+            // Check convergence, iterations etc.  checkConvergence() throws
+            // for a hard linear-solver failure, so set the history flag on
+            // that path as well; otherwise the next prepare() incorrectly
+            // reports prev_solve_failed=0 after a chopped attempt.
+            try {
+                last_solve_failed_ = !checkConvergence(result);
+            }
+            catch (...) {
+                last_solve_failed_ = true;
+                throw;
+            }
             return !last_solve_failed_;
         }
 
